@@ -1,0 +1,24 @@
+[project]
+name = "viofo-panoramax"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "av>=18.1.0",
+    "ffmpeg-python>=0.2.0",
+    "panoramax-cli>=1.4.1",
+    "pillow>=12.3.0",
+    "python-dateutil>=2.9.0.post0",
+]
+
+[tool.uv.workspace]
+members = [
+    ".",
+]
+
+[tool.uv.sources]
+viofo-panoramax = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "viofo-panoramax",
+]
