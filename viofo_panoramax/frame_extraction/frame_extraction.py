@@ -2,6 +2,7 @@ import datetime
 import io
 import os
 import sys
+from typing import Optional
 
 from PIL import Image, ExifTags
 import av
@@ -26,25 +27,64 @@ def deg_min_sec(value: float):
         IFDRational(int(round(s * 100)), 100),
     )
 
-def extract_image_sequence(video_in_path: str):
+def apply_exif(img: Image, gps_dt: datetime.datetime, gps: dict, rear: bool = False):
+    exif: Image.Exif = img.getexif()
+
+    gps_ifd = exif.get_ifd(ExifTags.IFD.GPSInfo)
+
+    # https://www.chiark.greenend.org.uk/doc/libimage-exiftool-perl/html/TagNames/GPS.html
+    gps_ifd[ExifTags.GPS.GPSLatitudeRef] = gps['Loc']['Lat']['Hemi']
+    gps_ifd[ExifTags.GPS.GPSLatitude] = deg_min_sec(gps['Loc']['Lat']['Float'])
+
+    gps_ifd[ExifTags.GPS.GPSLongitudeRef] = gps['Loc']['Lon']['Hemi']
+    gps_ifd[ExifTags.GPS.GPSLongitude] = deg_min_sec(gps['Loc']['Lon']['Float'])
+
+    gps_ifd[ExifTags.GPS.GPSTimeStamp] = (
+        IFDRational(gps_dt.hour, 1),
+        IFDRational(gps_dt.minute, 1),
+        IFDRational(gps_dt.second, 1),
+    )
+    gps_ifd[ExifTags.GPS.GPSDateStamp] = gps_dt.strftime("%Y:%m:%d")
+
+    if gps['Loc']['Speed'] is not None:
+        gps_ifd[ExifTags.GPS.GPSSpeedRef] = 'N'
+        gps_ifd[ExifTags.GPS.GPSSpeed] = IFDRational(
+            gps['Loc']['Speed'] / float(0.514444))  # we lose precision here! undoing fix_speed().
+
+
+    bearing = gps['Loc']['Bearing']
+    if rear:
+        bearing = (bearing + 180) % 360
+
+    if gps['Loc']['Bearing'] is not None:
+        gps_ifd[ExifTags.GPS.GPSImgDirectionRef] = 'T'
+        gps_ifd[ExifTags.GPS.GPSImgDirection] = IFDRational(bearing)
+
+    return exif
+
+def extract_image_sequence(video_in_path: str, video_in_path_rear: Optional[str]):
     # TODO: allow toggling of these options, especially deobf
     raw_gps_data = process_file(video_in_path, False, True)
 
     container = av.open(video_in_path)
-    print(container.streams[0].metadata.get('creation_time'))
+    camera_stream = container.streams[0]
 
-    probe = ffmpeg.probe(video_in_path)
+    rear_camera_container = None
+    rear_camera_stream = None
+    if video_in_path_rear is not None:
+        rear_camera_container = av.open(video_in_path_rear)
+        rear_camera_stream = rear_camera_container.streams[0]
 
+    creation_time_unsanitised = camera_stream.metadata.get('creation_time')
+    duration_unsanitised = float(camera_stream.duration * camera_stream.time_base)
 
-    video_end_time = dateutil.parser.parse(probe['streams'][0]['tags']['creation_time']) # set/local tz!
+    assert creation_time_unsanitised is not None
+    assert duration_unsanitised is not None
 
-    print(video_end_time)
-    return
-
+    video_end_time = dateutil.parser.parse(creation_time_unsanitised) # this tz-naive!
     video_end_time = video_end_time - datetime.timedelta(seconds=1) # account for some lag
 
-    #video_frame_rate: int = eval(probe['streams'][0]['']) # danger! https://stackoverflow.com/a/9558001/15124094
-    video_duration = datetime.timedelta(seconds=float(probe['streams'][0]['duration']))
+    video_duration = datetime.timedelta(seconds=duration_unsanitised)
 
     video_start_time = video_end_time - video_duration
 
@@ -52,69 +92,69 @@ def extract_image_sequence(video_in_path: str):
 
     raw_gps_data = [g for g in raw_gps_data if g is not None]
 
-
     last = None
     for gps in raw_gps_data:
         if gps:
             gps_dt = dateutil.parser.parse(gps['DT']['DT']) + datetime.timedelta(seconds=GPS_LAG_SECONDS)
 
-            print(f"GPS Fix @ {gps_dt}")
-
-            if last is not None and gps_dt - last < datetime.timedelta(seconds=1.5): # skip frames that will yield identically
+            # noinspection PyTypeChecker
+            if last is not None and gps_dt - last < datetime.timedelta(seconds=1): # skip frames that will yield identically
                 continue
 
             relative_video_time = gps_dt - video_start_time
             relative_video_time_seconds = relative_video_time.total_seconds()
-            relative_video_time_base_units = int(relative_video_time_seconds / container.streams[0].time_base)
+            relative_video_time_base_units = int(relative_video_time_seconds / camera_stream.time_base)
 
-            print(f"Fix is {round(relative_video_time_seconds, 1)}s into video ({relative_video_time_base_units} base units)")
+            print(f"{gps_dt} fix is {round(relative_video_time_seconds, 1)}s into video ({relative_video_time_base_units} base units)")
 
             last = gps_dt
 
-            container.seek(relative_video_time_base_units, stream=container.streams[0])
+            container.seek(relative_video_time_base_units, stream=camera_stream)
+            if rear_camera_container is not None:
+                rear_camera_container.seek(relative_video_time_base_units, stream=rear_camera_stream)
 
             target_pts = relative_video_time_base_units
             f = None
+            r = None
 
             for frame in container.decode(video=0):
                 if frame.pts is not None and frame.pts >= target_pts:
                     f = frame
                     break
 
+            if rear_camera_container is not None:
+                for frame in rear_camera_container.decode(video=0):
+                    if frame.pts is not None and frame.pts >= target_pts:
+                        r = frame
+                        break
+
+                if r is None:
+                    continue
+
             if f is None:
                 continue  # ran out of frames — target was past end of decodable stream
 
             #frame.save(f'/Users/oskar/OneDrive/Git/viofo-panoramax/test_footage/frames/{gps['Loc']['Lat']['Float']},{gps['Loc']['Lon']['Float']}.jpg')
-            img: Image = f.to_image()
-            exif: Image.Exif = img.getexif()
+            img_f: Image = f.to_image()
 
-            gps_ifd = exif.get_ifd(ExifTags.IFD.GPSInfo)
+            front_exif = apply_exif(img_f, gps_dt, gps)
 
-            # https://www.chiark.greenend.org.uk/doc/libimage-exiftool-perl/html/TagNames/GPS.html
-            gps_ifd[ExifTags.GPS.GPSLatitudeRef] = gps['Loc']['Lat']['Hemi']
-            gps_ifd[ExifTags.GPS.GPSLatitude] = deg_min_sec(gps['Loc']['Lat']['Float'])
+            img_f.save(f'/Users/oskar/OneDrive/Git/viofo-panoramax/test_footage/frames/{gps_dt.strftime('%Y-%m-%d %H:%M:%S')} {round(gps['Loc']['Lat']['Float'], 3)},{round(gps['Loc']['Lon']['Float'], 3)}F.jpg', exif=front_exif)
 
-            gps_ifd[ExifTags.GPS.GPSLongitudeRef] = gps['Loc']['Lon']['Hemi']
-            gps_ifd[ExifTags.GPS.GPSLongitude] = deg_min_sec(gps['Loc']['Lon']['Float'])
-
-            gps_ifd[ExifTags.GPS.GPSTimeStamp] = (
-                IFDRational(gps_dt.hour, 1),
-                IFDRational(gps_dt.minute, 1),
-                IFDRational(gps_dt.second, 1),
-            )
-            gps_ifd[ExifTags.GPS.GPSDateStamp] = gps_dt.strftime("%Y:%m:%d")
-
-            if gps['Loc']['Speed'] is not None:
-                gps_ifd[ExifTags.GPS.GPSSpeedRef] = 'N'
-                gps_ifd[ExifTags.GPS.GPSSpeed] = IFDRational(gps['Loc']['Speed'] / float(0.514444)) # we lose precision here! undoing fix_speed().
-
-            if gps['Loc']['Bearing'] is not None:
-                gps_ifd[ExifTags.GPS.GPSImgDirectionRef] = 'T'
-                gps_ifd[ExifTags.GPS.GPSImgDirection] = IFDRational(gps['Loc']['Bearing'])
-
-            img.save(f'/Users/oskar/OneDrive/Git/viofo-panoramax/test_footage/frames/{gps_dt.strftime('%Y-%m-%d %H:%M:%S')} {round(gps['Loc']['Lat']['Float'], 3)},{round(gps['Loc']['Lon']['Float'], 3)}.jpg', exif=exif)
+            if r is not None:
+                img_r: Image = r.to_image()
+                rear_exif = apply_exif(img_r, gps_dt, gps)
+                img_r.save(
+                    f'/Users/oskar/OneDrive/Git/viofo-panoramax/test_footage/frames/{gps_dt.strftime('%Y-%m-%d %H:%M:%S')} {round(gps['Loc']['Lat']['Float'], 3)},{round(gps['Loc']['Lon']['Float'], 3)}R.jpg',
+                    exif=rear_exif)
 
 
+def extract_dir(path: str):
+    for file in os.listdir(path):
+        file_path = os.path.join(path, file)
+        if os.path.isfile(file_path):
+            if file.removesuffix('.MP4').endswith("F"):
+                extract_image_sequence(file_path, None)
 
 
 
@@ -128,4 +168,6 @@ def extract_image_sequence(video_in_path: str):
 
 
 if __name__ == '__main__':
-    extract_image_sequence('/Users/oskar/Movies/Unreleased + Driving/20260519203638_203483F.MP4')
+    PATH = '/Volumes/VOLUME1/DCIM/Movie'
+
+    extract_dir(PATH)
